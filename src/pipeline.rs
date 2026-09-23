@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use tokio::sync::mpsc;
 
+use crate::stats::Stats;
+use crate::types::SourceEvent;
 use crate::types::SensorReading;
 
 /// Classification of a reading after the dedup/ordering gate.
@@ -20,7 +22,7 @@ pub enum Verdict {
 ///   is `Late` — too stale to matter, counted, then dropped.
 /// - Everything else is `Delivered`.
 pub struct Deduplicator {
-    seen: HashSet<u64>,
+    seen: std::collections::HashSet<u64>,
     high_water: u64,
     window: u64,
 }
@@ -29,7 +31,7 @@ impl Deduplicator {
     pub fn new(window: u64) -> Self {
         assert!(window > 0, "window must be nonzero");
         Deduplicator {
-            seen: HashSet::new(),
+            seen: std::collections::HashSet::new(),
             high_water: 0,
             window,
         }
@@ -67,6 +69,26 @@ impl Deduplicator {
     pub fn high_water(&self) -> u64 {
         self.high_water
     }
+}
+
+/// Async pipeline task: consumes a bounded channel of events, runs the
+/// deduplicator, accumulates stats.
+///
+/// Ownership note: `Deduplicator` and `Stats` live exclusively in this
+/// task; no mutex. Dropping the sender causes `rx.recv()` to return
+/// `None`, ending the loop — graceful shutdown by channel closure.
+pub async fn run_pipeline(mut rx: mpsc::Receiver<SourceEvent>, window: u64) -> Stats {
+    let mut dd = Deduplicator::new(window);
+    let mut stats = Stats::default();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            SourceEvent::Reading(r) => stats.record(dd.admit(&r)),
+            SourceEvent::Disconnected => stats.record_disconnect(),
+        }
+    }
+
+    stats
 }
 
 #[cfg(test)]
@@ -134,5 +156,46 @@ mod tests {
         let mut dd = Deduplicator::new(8);
         assert_eq!(dd.admit(&reading(0)), Verdict::Delivered);
         assert_eq!(dd.admit(&reading(1)), Verdict::Delivered);
+    }
+
+        #[tokio::test]
+    async fn run_pipeline_adjudicates_and_shuts_down_on_sender_drop() {
+        let (tx, rx) = mpsc::channel(4);
+
+        // Sender must be its own task: an awaited send on a full channel
+        // parks the task, so the consumer must already be scheduled
+        // (single-threaded test runtime).
+        let sender = tokio::spawn(async move {
+            for seq in 0..5 {
+                tx.send(SourceEvent::Reading(reading(seq))).await.unwrap();
+            }
+            tx.send(SourceEvent::Disconnected).await.unwrap();
+            // tx drops here: pipeline must observe closure and exit.
+        });
+
+        let stats = run_pipeline(rx, 64).await;
+        sender.await.unwrap();
+
+        let t = stats.totals();
+        assert_eq!(t.delivered, 5);
+        assert_eq!(t.disconnected, 1);
+        assert_eq!(stats.total_adjudicated(), 5);
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_counts_duplicates_across_channel() {
+        let (tx, rx) = mpsc::channel(2);
+
+        let sender = tokio::spawn(async move {
+            for seq in [3, 3, 4] {
+                tx.send(SourceEvent::Reading(reading(seq))).await.unwrap();
+            }
+        });
+
+        let stats = run_pipeline(rx, 64).await;
+        sender.await.unwrap();
+
+        assert_eq!(stats.totals().delivered, 2);
+        assert_eq!(stats.totals().duplicate, 1);
     }
 }

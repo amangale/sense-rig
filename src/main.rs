@@ -4,10 +4,9 @@ mod stats;
 mod types;
 
 use clap::Parser;
+use tokio::sync::mpsc;
 
-use crate::pipeline::Deduplicator;
-use crate::source::{Simulator, SourceConfig};
-use crate::stats::Stats;
+use crate::source::{run_source_task, SourceConfig, Simulator};
 use crate::types::SourceEvent;
 
 #[derive(Parser, Debug)]
@@ -52,9 +51,14 @@ struct Args {
     /// Reorder/dedup window size
     #[arg(long, default_value_t = 64)]
     window: u64,
+    #[arg(long, default_value_t = 32)]
+    channel_capacity: usize,
 }
 
-fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     let config = SourceConfig {
         rate_hz: args.rate_hz,
         jitter_ms: args.jitter_ms,
@@ -65,28 +69,19 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         seed: args.seed,
     };
 
-    let mut sim = Simulator::try_new(config)?;
-    let mut dd = Deduplicator::new(args.window);
-    let mut stats = Stats::default();
+    let (tx, rx) = mpsc::channel::<SourceEvent>(args.channel_capacity);
 
-    for _ in 0..args.ticks {
-        for event in sim.tick() {
-            match event {
-                SourceEvent::Reading(r) => stats.record(dd.admit(&r)),
-                SourceEvent::Disconnected => stats.record_disconnect(),
-            }
-        }
-    }
+    let source_handle = tokio::spawn(run_source_task(config, args.ticks, tx));
+    let pipeline_handle = tokio::spawn(pipeline::run_pipeline(rx, args.window));
+
+    let (source_result, pipeline_result) = tokio::join!(source_handle, pipeline_handle);
+
+    let (sim, channel_drops) = source_result??;
+    let pipeline_stats = pipeline_result?;
 
     println!("{}", sim.counts());
-    print!("{stats}");
+    print!("{pipeline_stats}");
+    eprintln!("channel drops: {channel_drops}");
     Ok(())
 }
 
-fn main() {
-    let args = Args::parse();
-    if let Err(e) = run(args) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
-}

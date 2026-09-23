@@ -20,7 +20,7 @@ Every branch has a counter: delivered, duplicate, dropped, late.
 
 - [x] Phase 1 — domain types, dedup + ordering gate, unit tests
 - [x] Phase 2 — source simulator with fault-injection dial, live counters
-- [ ] Phase 3 — tokio wiring, mpsc channels, backpressure, async pipeline
+- [x] Phase 3 — tokio wiring, mpsc channels, backpressure, async pipeline
 
 ## Run
 
@@ -28,11 +28,17 @@ Every branch has a counter: delivered, duplicate, dropped, late.
 
 ### Fault profile of your choosing:
 
-    cargo run -- --ticks 2000 --dup-prob 0.1 --drop-prob 0.05 --jitter-ms 40
+    cargo run -- --ticks 2000 --dup-prob 0.1 --drop-prob 0.05 --jitter-ms 40 --channel-capacity 16
 
 ### Tests:
 
     cargo test
+
+## Architecture
+
+- **Source task:** owns the RNG, emits readings, handles disconnects and drops.
+- **Pipeline task:** owns the deduplicator, accumulates verdicts.
+- **Channel:** bounded mpsc; `try_send` with drop-oldest emulation when full.
 
 ## Why
 

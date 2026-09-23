@@ -30,9 +30,9 @@ impl Stats {
         }
     }
 
-    /// Buffer-level drop (backpressure eviction, phase 3). Kept distinct
-    /// from source-level drops in the API even though both land in the
-    /// same counter — the caller decides which losses they caused.
+    /// Buffer-level drop (channel eviction). Kept distinct from
+    /// source-level drops in the API even though both land in the same
+    /// counter — the caller decides which losses they caused.
     pub fn record_drop(&mut self) {
         self.totals.dropped += 1;
     }
@@ -46,7 +46,7 @@ impl Stats {
     }
 
     /// Readings the deduplicator actually adjudicated (excludes the ones
-    /// the source never emitted).
+    /// the source never emitted or the channel evicted).
     pub fn total_adjudicated(&self) -> u64 {
         let t = self.totals;
         t.delivered + t.duplicate + t.late
@@ -79,7 +79,7 @@ impl fmt::Display for Stats {
             pct(t.duplicate, adj)
         )?;
         writeln!(f, "late         {:>8} ({})", t.late, pct(t.late, adj))?;
-        writeln!(f, "dropped      {:>8} (source + buffer)", t.dropped)?;
+        writeln!(f, "dropped      {:>8} (source + channel)", t.dropped)?;
         writeln!(f, "disconnected {:>8}", t.disconnected)
     }
 }
@@ -108,5 +108,63 @@ mod tests {
         let text = s.to_string();
         assert!(text.contains("delivered"));
         assert!(text.contains("n/a"));
+    }
+
+    #[test]
+    fn drop_and_disconnect_counters_are_independent_of_verdicts() {
+        // Lossy paths must not contaminate adjudication math: total_
+        // adjudicated counts only verdict branches, never dropped or
+        // disconnected events.
+        let mut s = Stats::default();
+        s.record_drop();
+        s.record_drop();
+        s.record_disconnect();
+        assert_eq!(s.total_adjudicated(), 0);
+        assert_eq!(s.totals().dropped, 2);
+        assert_eq!(s.totals().disconnected, 1);
+    }
+
+    #[test]
+    fn default_stats_display_makes_sense_on_an_empty_run() {
+        // A zero-tick run still prints; every line must carry n/a or 0.
+        let text = Stats::default().to_string();
+        assert!(text.contains("adjudicated: 0"));
+        assert!(text.contains("dropped"));
+        assert!(text.contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn full_run_conservation_through_the_pipeline() {
+        // End-to-end: simulator -> channel -> run_pipeline -> Stats.
+        // With a clean channel and generous window, every emission is
+        // adjudicated exactly once: adjudicated == source-emitted.
+        use crate::pipeline::run_pipeline;
+        use crate::source::{run_source_task, SourceConfig};
+        use crate::types::SourceEvent;
+
+        let config = SourceConfig {
+            dup_prob: 0.1,
+            drop_prob: 0.05,
+            disconnect_prob: 0.02,
+            ..Default::default()
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<SourceEvent>(256);
+        let source = tokio::spawn(run_source_task(config, 500, tx));
+        let stats = run_pipeline(rx, 64).await;
+
+        let (sim, channel_drops) = source.await.unwrap().unwrap();
+        assert_eq!(channel_drops, 0, "generous channel must not evict");
+
+        let counts = sim.counts();
+        assert_eq!(
+            stats.total_adjudicated(),
+            counts.emitted,
+            "adjudicated must equal source emissions"
+        );
+        // And the duplicate classifier catches exactly what the source
+        // injected — two independent observers, one number.
+        assert_eq!(stats.totals().duplicate, counts.duplicated);
+        assert_eq!(stats.totals().delivered, counts.generated - counts.dropped);
     }
 }

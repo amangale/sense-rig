@@ -1,4 +1,4 @@
-//! Source simulator with a fault-injection dial.
+//! Async source simulator with fault-injection dial.
 //!
 //! The simulator owns its clock and its RNG so runs are reproducible from
 //! a seed. Every fault decision bumps a counter: generated, dropped,
@@ -9,6 +9,7 @@ use std::fmt;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Serialize;
+use tokio::sync::mpsc;
 
 use crate::types::{ReadingKind, SensorReading, SourceEvent};
 
@@ -112,10 +113,6 @@ impl Simulator {
         self.counts
     }
 
-    pub fn config(&self) -> &SourceConfig {
-        &self.config
-    }
-
     /// Advance one source period. Outage semantics:
     ///
     /// - Tick T: `Disconnected` marker emitted, outage of exactly
@@ -207,6 +204,34 @@ impl Simulator {
     }
 }
 
+/// Async source task: runs for `ticks` cycles, pushes events through the
+/// bounded channel the caller created, counts `try_send` failures as
+/// channel drops (drop-newest policy, observed and counted), then drops
+/// the sender so the pipeline task observes channel closure.
+pub async fn run_source_task(
+    config: SourceConfig,
+    ticks: usize,
+    tx: mpsc::Sender<SourceEvent>,
+) -> Result<(Simulator, usize), SourceError> {
+    let mut sim = Simulator::try_new(config)?;
+    let mut channel_drops = 0;
+
+    for _ in 0..ticks {
+        for event in sim.tick() {
+            if tx.try_send(event).is_err() {
+                channel_drops += 1;
+            }
+        }
+        // Yield to the executor each cycle so receivers get a chance to run.
+        // This is purely scheduling hygiene; the simulator doesn't do I/O
+        // that would naturally yield.
+        tokio::task::yield_now().await;
+    }
+
+    drop(tx);
+    Ok((sim, channel_drops))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +262,7 @@ mod tests {
 
     #[test]
     fn rejects_nan_probability() {
+        // NaN fails the range check: no silent poison in the dial.
         let cfg = SourceConfig {
             drop_prob: f64::NAN,
             ..clean_config()
@@ -340,6 +366,8 @@ mod tests {
 
     #[test]
     fn timestamps_never_regress_more_than_jitter() {
+        // With zero faults, any adjacent readings may swap order, but only
+        // within the jitter envelope — the reorder window's justification.
         let cfg = SourceConfig {
             jitter_ms: 50,
             rate_hz: 10.0,
@@ -355,5 +383,56 @@ mod tests {
                 }
             }
         }
+    }
+
+        #[tokio::test]
+    async fn source_task_delivers_events_and_closes_channel() {
+        // The consumer must run concurrently with the source, as in prod.
+        // Capacity 2 with a live drainer: nothing is evicted, everything
+        // emitted is received, and closure ends recv().
+        let (tx, mut rx) = mpsc::channel(2);
+
+        let source = tokio::spawn(run_source_task(clean_config(), 50, tx));
+
+        let mut received = 0;
+        let mut saw_disconnected = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                SourceEvent::Reading(_) => received += 1,
+                SourceEvent::Disconnected => saw_disconnected = true,
+            }
+        }
+
+        let (sim, channel_drops) = source.await.unwrap().unwrap();
+
+        assert_eq!(received, sim.counts().emitted as usize);
+        assert_eq!(channel_drops, 0, "concurrent drainer must prevent eviction");
+        assert!(!saw_disconnected, "disconnect_prob=0 must never fire");
+    }
+
+    #[tokio::test]
+    async fn source_task_counts_channel_drops_when_starved() {
+        // Receiver never drains: capacity-1 channel, producer floods.
+        // Every admission beyond the first must be counted, not silent.
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_, channel_drops) = run_source_task(clean_config(), 10, tx).await.unwrap();
+
+        let queued = rx.recv().await; // consume the one buffered event
+        assert!(queued.is_some());
+        let drained: Vec<_> = {
+            let mut v = Vec::new();
+            while let Some(e) = rx.recv().await {
+                v.push(e);
+            }
+            v
+        };
+        assert!(drained.is_empty(), "after the buffer, channel must be closed");
+
+        let emitted = 10usize;
+        assert_eq!(
+            channel_drops,
+            emitted - 1,
+            "cap-1 channel with no consumer: exactly one survives, rest counted"
+        );
     }
 }
