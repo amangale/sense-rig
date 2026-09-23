@@ -19,10 +19,18 @@ Every branch has a counter: delivered, duplicate, dropped, late.
 ## Status
 
 - [x] Phase 1 — domain types, dedup + ordering gate, unit tests
-- [ ] Phase 2 — source simulator with fault-injection dial
-- [ ] Phase 3 — tokio wiring, mpsc channels, backpressure, live counters
+- [x] Phase 2 — source simulator with fault-injection dial, live counters
+- [ ] Phase 3 — tokio wiring, mpsc channels, backpressure, async pipeline
 
 ## Run
+
+    cargo run
+
+### Fault profile of your choosing:
+
+    cargo run -- --ticks 2000 --dup-prob 0.1 --drop-prob 0.05 --jitter-ms 40
+
+### Tests:
 
     cargo test
 
